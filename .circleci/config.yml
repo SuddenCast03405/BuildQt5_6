@@ -1,0 +1,93 @@
+version: 2.1
+
+executors:
+  win2019:
+    machine:
+      image: 'windows-server-2019-vs2019:current'
+    resource_class: windows.xlarge
+  win2022:
+    machine:
+      image: 'windows-server-2022-gui:current'
+    resource_class: windows.xlarge
+
+commands:
+  build-static-qt:
+    parameters:
+      toolset:
+        type: enum
+        enum: [msvc2015, msvc2017, msvc2019, msvc2022]
+      qt:
+        type: string
+    steps:
+      - checkout
+      - run:
+          name: Runner information
+          shell: powershell.exe -ExecutionPolicy Bypass
+          command: |
+            Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+            Get-PSDrive C | Select-Object Used, Free
+            Write-Host "Logical processors: $([Environment]::ProcessorCount)"
+      - run:
+          name: Install << parameters.toolset >> toolchain
+          shell: powershell.exe -ExecutionPolicy Bypass
+          command: .\scripts\install-toolchain.ps1 -Toolset '<< parameters.toolset >>'
+          no_output_timeout: 90m
+      - run:
+          name: Build static Qt << parameters.qt >> (x64)
+          shell: powershell.exe -ExecutionPolicy Bypass
+          command: .\scripts\build-static-qt.ps1 -Toolset '<< parameters.toolset >>' -QtVersion '<< parameters.qt >>'
+          no_output_timeout: 120m
+      - store_artifacts:
+          path: artifacts
+          destination: qt-static
+
+jobs:
+  build-win2019:
+    parameters:
+      toolset:
+        type: enum
+        enum: [msvc2015, msvc2017, msvc2019]
+      qt:
+        type: string
+    executor: win2019
+    steps:
+      - build-static-qt:
+          toolset: << parameters.toolset >>
+          qt: << parameters.qt >>
+
+  build-win2022:
+    parameters:
+      toolset:
+        type: enum
+        enum: [msvc2022]
+      qt:
+        type: string
+    executor: win2022
+    steps:
+      - build-static-qt:
+          toolset: << parameters.toolset >>
+          qt: << parameters.qt >>
+
+workflows:
+  static-qt:
+    jobs:
+      - build-win2019:
+          name: msvc2015-qt-<< matrix.qt >>
+          toolset: msvc2015
+          matrix:
+            parameters:
+              qt: ["5.12.12", "5.15.2"]
+      - build-win2019:
+          name: msvc2017-qt-5.15.2
+          toolset: msvc2017
+          qt: "5.15.2"
+      - build-win2019:
+          name: msvc2019-qt-6.5.3
+          toolset: msvc2019
+          qt: "6.5.3"
+      - build-win2022:
+          name: msvc2022-qt-<< matrix.qt >>
+          toolset: msvc2022
+          matrix:
+            parameters:
+              qt: ["6.8.3", "latest"]
