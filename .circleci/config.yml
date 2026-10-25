@@ -4,11 +4,11 @@ executors:
   win2019:
     machine:
       image: 'windows-server-2019-vs2019:current'
-    resource_class: windows.xlarge
+    resource_class: windows.medium
   win2022:
     machine:
       image: 'windows-server-2022-gui:current'
-    resource_class: windows.xlarge
+    resource_class: windows.medium
 
 commands:
   build-static-qt:
