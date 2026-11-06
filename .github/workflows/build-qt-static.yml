@@ -1,129 +1,403 @@
-# .github/workflows/build-qt-static.yml
-name: Build Qt 5 Static (MSVC 2019)
+name: build-qt-static
+
+# 静态版 Qt 构建矩阵（Windows / MSVC）
+#   MSVC 2015 (v140) -> Qt 5.12 LTS latest
+#   MSVC 2017 (v141) -> Qt 5.15 LTS latest
+#   MSVC 2019 (v142) -> Qt 6.2 LTS latest / Qt 6.5 LTS latest
+#   MSVC 2022 (v143) -> Qt 6.8 LTS latest / Qt 6.12 LTS latest
 
 on:
   workflow_dispatch:
+    inputs:
+      qt_versions:
+        description: '只构建指定版本（空格分隔，如 6.5 6.12；留空=全部）'
+        required: false
+        default: ''
+        type: string
+      modules:
+        description: '模块预设: minimal | recommended | full'
+        required: false
+        default: 'recommended'
+        type: choice
+        options: [minimal, recommended, full]
+      static_runtime:
+        description: '静态 CRT (/MT)'
+        required: false
+        default: true
+        type: boolean
+      strict_toolset:
+        description: '严格匹配工具集（runner 上没有对应 v140/v141 时直接失败，不回退）'
+        required: false
+        default: false
+        type: boolean
+      qt_repo:
+        description: '源码来源: official | mirrors(国内镜像)'
+        required: false
+        default: 'official'
+        type: choice
+        options: [official, mirrors]
+      release_assets:
+        description: '构建完成后创建/更新 Release 并上传资产'
+        required: false
+        default: true
+        type: boolean
   push:
-    branches: [ main ]
-    paths:
-      - '.github/workflows/build-qt-static.yml'
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/build-qt-static.yml']
+  schedule:
+    # 每周一 03:00 UTC 检查各 LTS 是否有新补丁版本（例如 Qt 企业版补丁释放到 open-source 之后）
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-qt-static-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  QT_VERSION: "5.15.18"
-  QT_SRC_URL: "https://download.qt.io/archive/qt/5.15/5.15.18/single/qt-everywhere-opensource-src-5.15.18.zip"
-  QT_INSTALL_PREFIX: "C:/Qt/5.15.18_static/msvc2019_64"
-  SRC_DIR: "C:/qt-src"
+  QT_SRC_BASE: https://download.qt.io/online/qtsdkrepository/windows_x86/desktop
+  QT_SRC_MIRROR: https://mirrors.tuna.tsinghua.edu.cn/qt/online/qtsdkrepository/windows_x86/desktop
 
 jobs:
-  build-qt-static:
-    name: Build Qt Static
+  # ---------------------------------------------------------------------------
+  # 1) 解析各 LTS 线的最新补丁版本，输出给矩阵
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: resolve LTS versions
     runs-on: windows-2022
-    timeout-minutes: 720
-    
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      has_build: ${{ steps.gen.outputs.has_build }}
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Setup MSVC 2019 Toolset (on VS2022 image)
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
-        toolset: 14.2
+      - name: Resolve latest patch of each LTS series
+        id: gen
+        shell: pwsh
+        env:
+          REQ: ${{ inputs.qt_versions }}
+          MODULES: ${{ inputs.modules || 'recommended' }}
+          CRT: ${{ inputs.static_runtime && 'mt' || 'md' }}
+        run: ./scripts/resolve-matrix.ps1 -Series '5.12','5.15','6.2','6.5','6.8','6.12' -Filter "$env:REQ" -ModulePreset "$env:MODULES" -Crt "$env:CRT"
 
-    - name: Install prerequisites
-      shell: cmd
-      run: |
-        choco install strawberryperl -y --no-progress
-        choco install 7zip -y --no-progress
-        refreshenv
+  # ---------------------------------------------------------------------------
+  # 2) 构建矩阵
+  # ---------------------------------------------------------------------------
+  matrix:
+    name: Qt${{ matrix.qt }} static ${{ matrix.arch }} ${{ matrix.crt }}
+    needs: prepare
+    if: needs.prepare.outputs.has_build == 'true'
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 480
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
-    - name: Create directories
-      shell: cmd
-      run: |
-        mkdir "%SRC_DIR%"
-        mkdir "%QT_INSTALL_PREFIX%"
+    env:
+      QT_VERSION: ${{ matrix.qt }}
+      QT_ARCH: ${{ matrix.arch }}
+      MSVC_VERSION: ${{ matrix.msvc }}
+      STATIC_CRT: ${{ matrix.crt }}
+      SKIP_MODULES: ${{ matrix.skip }}
+      QT_INSTALL_ROOT: D:\Qt
+      QT_PREFIX: D:\Qt\${{ matrix.qt }}\${{ matrix.arch }}_static
+      BUILD_ROOT: D:\qtbuild
+      STAGING: D:\staging
+      SRCDIR: C:\qt-src
 
-    - name: Download Qt Source
-      shell: pwsh
-      run: |
-        Invoke-WebRequest -Uri $env:QT_SRC_URL -OutFile "$env:SRC_DIR\qt-src.zip" -UseBasicParsing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Extract Qt Source
-      shell: cmd
-      run: |
-        cd /d "%SRC_DIR%"
-        "C:\Program Files\7-Zip\7z.exe" x qt-src.zip -o"%SRC_DIR%" -y
+      - name: Show environment
+        shell: pwsh
+        run: |
+          Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption) $((Get-CimInstance Win32_OperatingSystem).Version)"
+          Write-Host "vswhere: $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -format value -property installationPath)"
+          Write-Host "Free space:"; Get-PSDrive C,D | Select-Object Name,@{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
 
-    - name: Configure Qt (Static Build)
-      shell: cmd
-      working-directory: ${{ env.SRC_DIR }}/qt-everywhere-src-${{ env.QT_VERSION }}
-      run: |
-        echo "=== Qt Configure ==="
-        configure.bat ^
-          -prefix "%QT_INSTALL_PREFIX%" ^
-          -platform win32-msvc2019 ^
-          -static ^
-          -static-runtime ^
-          -release ^
-          -opensource ^
-          -confirm-license ^
-          -nomake examples ^
-          -nomake tests ^
-          -mp ^
-          -no-openssl ^
-          -sql-sqlite ^
-          -qt-sqlite ^
-          -qt-zlib ^
-          -qt-libpng ^
-          -qt-libjpeg ^
-          -skip qtwebengine ^
-          -skip qt3d ^
-          -skip qtsensors ^
-          -skip qtlocation ^
-          -skip qtdoc ^
-          -skip qtwayland ^
-          -skip qtwebglplugin ^
-          -skip qtactiveqt ^
-          -skip qtlottie ^
-          -skip qtremoteobjects ^
-          -skip qtnetworkauth ^
-          -skip qtspeech
+      - name: Enable long paths and clean disks
+        shell: pwsh
+        run: |
+          # Qt 6 构建目录层级很深，必须解除 260 字符限制
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f | Out-Null
+          git config --system core.longpaths true
+          # D 盘在 GitHub 托管 runner 上不存在，需要自建
+          if (-not (Test-Path D:\)) { New-Item -ItemType Directory -Path D:\ -Force | Out-Null }
+          if (Test-Path 'C:\Program Files\Microsoft Visual Studio\2022') { Write-Host 'VS2022 present' }
+          Write-Host "actions=$((Get-ChildItem $env:RUNNER_TOOL_CACHE -Directory -ErrorAction SilentlyContinue | Measure-Object).Count)"
 
-    - name: Build Qt
-      shell: cmd
-      working-directory: ${{ env.SRC_DIR }}/qt-everywhere-src-${{ env.QT_VERSION }}
-      run: |
-        echo "=== Starting nmake (3-6 hours) ==="
-        nmake
-        if %errorlevel% neq 0 exit /b %errorlevel%
+      - name: Install MSVC toolset
+        shell: pwsh
+        # matrix.msvc 是 140/141/142/143，对应 v140..v143
+        # 托管 runner 只有 v142/v143：默认回退并打 warning，strict_toolset=true 时直接失败
+        env:
+          STRICT: ${{ inputs.strict_toolset && 'true' || 'false' }}
+        run: |
+          $extra = @()
+          if ($env:STRICT -eq 'true') { $extra += '-Strict' }
+          ./scripts/setup-msvc.ps1 -MsvcVersion ${{ matrix.msvc }} -Arch amd64 @extra
 
-    - name: Install Qt
-      shell: cmd
-      working-directory: ${{ env.SRC_DIR }}/qt-everywhere-src-${{ env.QT_VERSION }}
-      run: |
-        nmake install
+      - name: Install Perl (Qt5 configure only)
+        if: ${{ startsWith(matrix.qt, '5.') }}
+        shell: pwsh
+        run: |
+          # Qt5 的 configure 是 perl 脚本（syncqt.pl / configure 本体），windows runner 上没有 perl
+          # Qt6 已改为 CMake 自举，不需要
+          if (Get-Command perl -ErrorAction SilentlyContinue) {
+            Write-Host "perl 已存在: $((Get-Command perl).Source)"
+            perl -v | Select-Object -First 2 | ForEach-Object { Write-Host $_ }
+          }
+          else {
+            choco install strawberryperl -y --no-progress
+            $perlBin = 'C:\Strawberry\perl\bin'
+            if (Test-Path $perlBin) { $perlBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
+            Write-Host "已安装 strawberryperl"
+          }
 
-    - name: Verify Installation
-      shell: pwsh 
-      run: |
-        Write-Host "=== Verifying Qt Installation ==="
-        
-        # 检查 qmake
-        & "$env:QT_INSTALL_PREFIX/bin/qmake.exe" -v
-        if ($LASTEXITCODE -ne 0) { 
-          Write-Host "❌ qmake verification failed"
-          exit 1 
-        }
+      - name: Fetch Qt source
+        shell: pwsh
+        run: ./scripts/get-qt-source.ps1 -Version $env:QT_VERSION -Dest $env:SRCDIR -Repo ${{ inputs.qt_repo || 'official' }} -Exclude $env:SKIP_MODULES
 
-    - name: Package Build
-      shell: pwsh
-      run: |
-        $zip = "qt-$env:QT_VERSION-static-msvc2019_64.zip"
-        & "C:\Program Files\7-Zip\7z.exe" a -tzip -mx=9 $zip "$env:QT_INSTALL_PREFIX/*"
+      - name: Configure Qt
+        shell: pwsh
+        run: |
+          # Qt5 与 Qt6 的构建系统不同，必须分别处理：
+          #   Qt5: 源码树内 configure.bat -> Makefile -> nmake
+          #   Qt6: 源码树外 CMake configure -> cmake --build
+          #
+          # 参数合法性是逐条对着源码里的 configure 解析器核过的（别凭印象改）：
+          #   * Qt6 拒绝 -module-<x>（QtProcessConfigureArgs.cmake: Unknown command line option）
+          #   * Qt6 的 -static-runtime 是 boolean，只能写 -static-runtime / -no-static-runtime，
+          #     写 -static-runtime=yes 会被当成未知选项直接失败
+          #   * Qt6 的 -skip 一次吃一个逗号分隔列表；Qt5 的 -skip 一次只吃一个模块
+          $isQt5 = $env:QT_VERSION -match '^5\.'
+          $useStaticCrt = ($env:STATIC_CRT -eq 'mt')
+          $skip = @(($env:SKIP_MODULES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: qt-static-build
-        path: qt-*.zip
-        retention-days: 7
+          $common = @('-prefix', $env:QT_PREFIX, '-static', '-release',
+                      '-opensource', '-confirm-license',
+                      '-nomake', 'examples', '-nomake', 'tests', '-no-pch')
+
+          if ($isQt5) {
+            $cfg = $common + @('-qt-zlib', '-qt-libpng', '-qt-libjpeg', '-qt-freetype', '-qt-pcre')
+            # 静态 Qt5 在 Windows 上必须用 desktop GL：默认的 -opengl dynamic 需要
+            # opengl32sw.dll，静态构建下 configure 直接报 pre-condition 不满足
+            $cfg += @('-opengl', 'desktop')
+            if ($useStaticCrt) { $cfg += '-static-runtime' }
+            foreach ($m in $skip) { $cfg += @('-skip', $m) }
+
+            $log = Join-Path $env:BUILD_ROOT 'configure.log'
+            New-Item -ItemType Directory -Force -Path $env:BUILD_ROOT | Out-Null
+            # 5.15 是整树包（configure.bat 在根）；5.12 只有拆分包，configure.bat 在 qtbase/
+            $cfgDir = $env:SRCDIR
+            if (-not (Test-Path (Join-Path $cfgDir 'configure.bat'))) {
+              $cfgDir = Join-Path $env:SRCDIR 'qtbase'
+              Write-Host "模块化源码树，在 qtbase/ 里 configure"
+            }
+            Push-Location $cfgDir
+            try {
+              Write-Host "configure 参数: $($cfg -join ' ')"
+              cmd /c "configure.bat $($cfg -join ' ')" 2>&1 | Tee-Object -FilePath $log
+              $code = $LASTEXITCODE
+            }
+            finally { Pop-Location }
+            if ($code -ne 0) {
+              Write-Host "::group::configure.log (tail)"
+              Get-Content $log -Tail 120
+              Write-Host "::endgroup::"
+              throw "configure failed with exit code $code"
+            }
+          }
+          else {
+            $cfg = $common + @('-qt-zlib', '-qt-libpng', '-qt-libjpeg', '-qt-freetype', '-no-feature-vulkan')
+            $cfg += $(if ($useStaticCrt) { '-static-runtime' } else { '-no-static-runtime' })
+            if ($skip.Count -gt 0) { $cfg += @('-skip', ($skip -join ',')) }
+
+            $log = Join-Path $env:BUILD_ROOT 'configure.log'
+            New-Item -ItemType Directory -Force -Path $env:BUILD_ROOT | Out-Null
+            Push-Location $env:BUILD_ROOT
+            try {
+              Write-Host "configure 参数: $($cfg -join ' ')"
+              # Qt6 的 configure.bat 在源码根；在 build 目录里调用它做 shadow build
+              cmd /c "`"$env:SRCDIR\configure.bat`" $($cfg -join ' ')" 2>&1 | Tee-Object -FilePath $log
+              $code = $LASTEXITCODE
+            }
+            finally { Pop-Location }
+            if ($code -ne 0) {
+              Write-Host "::group::configure.log (tail)"
+              Get-Content $log -Tail 120
+              Write-Host "::endgroup::"
+              throw "configure failed with exit code $code"
+            }
+          }
+
+      - name: Build Qt
+        shell: pwsh
+        run: |
+          $isQt5 = $env:QT_VERSION -match '^5\.'
+          $log = Join-Path $env:BUILD_ROOT 'build.log'
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+
+          if ($isQt5) {
+            $buildDir = $env:SRCDIR
+            if (-not (Test-Path (Join-Path $buildDir 'Makefile'))) { $buildDir = Join-Path $env:SRCDIR 'qtbase' }
+            Push-Location $buildDir
+            try {
+              cmd /c "nmake" 2>&1 | Tee-Object -FilePath $log
+              $code = $LASTEXITCODE
+            }
+            finally { Pop-Location }
+          }
+          else {
+            Push-Location $env:BUILD_ROOT
+            try {
+              cmd /c "cmake --build . --config Release --parallel $env:NUMBER_OF_PROCESSORS" 2>&1 | Tee-Object -FilePath $log
+              $code = $LASTEXITCODE
+            }
+            finally { Pop-Location }
+          }
+
+          Write-Host ("构建耗时 {0:n1} 分钟" -f $sw.Elapsed.TotalMinutes)
+          if ($code -ne 0) {
+            Write-Host "::group::build.log (errors)"
+            Select-String -Path $log -Pattern 'error|fatal error' | Select-Object -Last 80 | ForEach-Object { $_.Line }
+            Write-Host "::endgroup::"
+            throw "build failed with exit code $code"
+          }
+
+      - name: Install Qt
+        shell: pwsh
+        run: |
+          # Qt5 整树包: nmake install
+          # Qt5 模块拆分树(5.12): qtbase 先 install，再逐模块 qmake/nmake/nmake install
+          # Qt6: cmake --install . --config Release
+          if ($env:QT_VERSION -match '^5\.') {
+            $isTree = Test-Path (Join-Path $env:SRCDIR 'configure.bat')
+            $baseDir = if ($isTree) { $env:SRCDIR } else { Join-Path $env:SRCDIR 'qtbase' }
+
+            Push-Location $baseDir
+            try { cmd /c "nmake install" 2>&1 | Tee-Object -FilePath "$env:BUILD_ROOT\install.log"; $code = $LASTEXITCODE }
+            finally { Pop-Location }
+            if ($code -ne 0) { throw "qtbase install failed with exit code $code" }
+
+            if (-not $isTree) {
+              # 依赖顺序：先 declarative，再控件/工具，最后依赖多的模块
+              $order = @('qtdeclarative','qtsvg','qtgraphicaleffects','qtquickcontrols2','qtquickcontrols',
+                         'qtwinextras','qtimageformats','qtnetworkauth','qtwebsockets','qtwebchannel',
+                         'qtserialport','qtserialbus','qtsensors','qtcharts','qtmultimedia','qtspeech',
+                         'qtconnectivity','qtlocation','qtvirtualkeyboard','qtscxml','qtremoteobjects',
+                         'qttools','qttranslations','qtactiveqt')
+              $all = @(Get-ChildItem $env:SRCDIR -Directory | Where-Object {
+                $_.Name -ne 'qtbase' -and (Test-Path (Join-Path $_.FullName '.qmake.conf'))
+              })
+              $byName = @{}
+              foreach ($d in $all) { $byName[$d.Name] = $d }
+
+              $queue = @()
+              foreach ($n in $order) { if ($byName.ContainsKey($n)) { $queue += $n } }
+              foreach ($d in $all) { if ($order -notcontains $d.Name) { $queue += $d.Name } }
+
+              $qmake = Join-Path $env:QT_PREFIX 'bin\qmake.exe'
+              if (-not (Test-Path $qmake)) { throw "qtbase install 后仍没有 qmake: $qmake" }
+
+              foreach ($n in $queue) {
+                $dir = $byName[$n].FullName
+                Write-Host "::group::module $n"
+                Push-Location $dir
+                try {
+                  cmd /c "`"$qmake`" -r" 2>&1 | Tee-Object -FilePath "$env:BUILD_ROOT\module-$n.log"
+                  if ($LASTEXITCODE -ne 0) { throw "qmake 失败: $n" }
+                  cmd /c "nmake" 2>&1 | Tee-Object -FilePath "$env:BUILD_ROOT\module-$n.log" -Append
+                  if ($LASTEXITCODE -ne 0) { throw "nmake 失败: $n" }
+                  cmd /c "nmake install" 2>&1 | Tee-Object -FilePath "$env:BUILD_ROOT\module-$n.log" -Append
+                  if ($LASTEXITCODE -ne 0) { throw "nmake install 失败: $n" }
+                }
+                finally { Pop-Location }
+                Write-Host '::endgroup::'
+              }
+              Write-Host ("已安装 {0} 个模块" -f $queue.Count)
+            }
+          }
+          else {
+            Push-Location $env:BUILD_ROOT
+            try { cmd /c "cmake --install . --config Release" 2>&1 | Tee-Object -FilePath "$env:BUILD_ROOT\install.log"; $code = $LASTEXITCODE }
+            finally { Pop-Location }
+            if ($code -ne 0) { throw "install failed with exit code $code" }
+          }
+          ./scripts/verify-install.ps1 -Prefix $env:QT_PREFIX -Version $env:QT_VERSION -Arch $env:QT_ARCH
+
+      - name: Static link self-test
+        shell: pwsh
+        run: ./scripts/smoke-test.ps1 -Prefix $env:QT_PREFIX -Version $env:QT_VERSION -Work (Join-Path $env:BUILD_ROOT 'smoke')
+
+      - name: Package
+        shell: pwsh
+        # 用实际生效的工具集写进 BUILDINFO（回退时请求值和实际值会不同）
+        run: ./scripts/package-qt.ps1 -Prefix $env:QT_PREFIX -Version $env:QT_VERSION -Arch $env:QT_ARCH -Vcvars $env:MSVC_EFFECTIVE -Crt $env:STATIC_CRT -OutDir $env:STAGING
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt${{ matrix.qt }}-static-${{ matrix.arch }}-${{ matrix.crt }}
+          path: ${{ env.STAGING }}\*.7z
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-qt${{ matrix.qt }}-${{ matrix.arch }}
+          path: |
+            D:\qtbuild\configure.log
+            D:\qtbuild\build.log
+            D:\qtbuild\install.log
+          retention-days: 7
+          if-no-files-found: ignore
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # 3) 汇总并发布
+  # ---------------------------------------------------------------------------
+  release:
+    name: publish
+    needs: [matrix]
+    if: ${{ !cancelled() && needs.matrix.result != 'skipped' && (inputs.release_assets || startsWith(github.ref, 'refs/tags/')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          ls -lh
+          sha256sum *.7z > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'qt-static-latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Qt static builds (latest)' }}
+          body: |
+            Qt 静态构建产物（MSVC，release，静态 CRT 见文件名）。
+            每个压缩包为 `prefix` 布局，可直接 `set CMAKE_PREFIX_PATH=<解压目录>` 使用。
+            校验：`sha256sum -c SHA256SUMS.txt`
+          files: |
+            dist/*.7z
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: false
+          prerelease: false
