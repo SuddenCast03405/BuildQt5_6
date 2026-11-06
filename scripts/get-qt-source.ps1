@@ -146,7 +146,14 @@ New-Item -ItemType Directory -Path $Dest -Force | Out-Null
 
 $Work = Join-Path $env:RUNNER_TEMP 'qt-src-download'
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
-$Stage = Join-Path $Work 'stage'
+
+# 解压暂存目录必须和目标在同一个盘。
+# RUNNER_TEMP 在 D 盘而 SRCDIR 在 C 盘时，最后的「把模块搬到 Dest」会退化成
+# 跨盘复制 + 删除：实测 3.5GB / 十几万个小文件搬了 10 分钟，比解压本身还慢。
+# 放在 Dest 同级目录，Move-Item 就是纯元数据操作，秒级完成。
+$StageRoot = Split-Path -Parent $Dest
+if (-not $StageRoot) { $StageRoot = $Dest }
+$Stage = Join-Path $StageRoot ('.qt-src-stage-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 if (Test-Path $Stage) { Remove-Item -Path $Stage -Recurse -Force }
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 
@@ -252,9 +259,29 @@ if (-not $qtbaseDir) { throw "解压后在 $Stage 下找不到 qtbase 目录（�
 $realRoot = $qtbaseDir.Parent.FullName
 Write-Host ("源码根目录: {0}" -f $realRoot)
 
-foreach ($item in Get-ChildItem $realRoot) {
-    Move-Item -Path $item.FullName -Destination $Dest -Force
+# 整树包解出来的东西全都藏在 qt-everywhere-src-X.Y.Z 这一层里，而 -Dest 本身
+# 已经是空目录：直接把那一层 rename 成 -Dest 的内容最快（同盘 rename 是元数据操作）。
+$swMove = [Diagnostics.Stopwatch]::StartNew()
+if ([IO.Path]::GetFullPath($realRoot).TrimEnd('\') -eq [IO.Path]::GetFullPath($Dest).TrimEnd('\')) {
+    Write-Host '  解压根即目标目录，无需搬移'
 }
+elseif (-not (Test-Path (Join-Path $Dest 'qtbase')) -and
+        -not (Get-ChildItem $Dest -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+    # Dest 还是空的：把 realRoot 里的项逐个 rename 到 Dest（同盘，秒级）
+    foreach ($item in Get-ChildItem $realRoot -Force) {
+        Move-Item -LiteralPath $item.FullName -Destination (Join-Path $Dest $item.Name) -Force
+    }
+}
+else {
+    foreach ($item in Get-ChildItem $realRoot -Force) {
+        Move-Item -LiteralPath $item.FullName -Destination $Dest -Force
+    }
+}
+$swMove.Stop()
+Write-Host ("归位用时 {0:n1} 秒" -f $swMove.Elapsed.TotalSeconds)
+
+# 清理暂存目录（此时里面只剩空壳或下载残留）
+if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue }
 
 # ---------------------------------------------------------------------------
 # 4) 校验源码结构
