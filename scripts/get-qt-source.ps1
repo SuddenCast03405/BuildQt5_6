@@ -52,6 +52,75 @@ function Get-SdkTag([string] $Ver) {
     return ('{0}_{0}{1}{2}' -f $p[0], $p[1], $p[2])
 }
 
+# Windows runner 上 Invoke-WebRequest 下大文件极慢（会先在内存里拼完整响应），
+# 几百 MB 的 tar.xz 能拖上十几分钟。优先用系统自带 curl.exe（Win10 1803+），
+# 带 --retry 与断点续传；没有 curl 时才退回 Invoke-WebRequest。
+function Invoke-Download([string] $Url, [string] $OutFile) {
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curl) { $curl = Get-Command curl -ErrorAction SilentlyContinue }
+    if ($curl) {
+        # -L 跟随重定向, -C - 断点续传, --retry 网络抖动重试, -f HTTP 错误码直接失败
+        & $curl.Source -L -f -C - --retry 5 --retry-delay 5 --retry-all-errors `
+            --connect-timeout 30 --speed-time 120 --speed-limit 10240 `
+            -o $OutFile $Url
+        if ($LASTEXITCODE -ne 0) { throw "curl 下载失败 (exit $LASTEXITCODE): $Url" }
+    }
+    else {
+        Write-Host '  (未找到 curl.exe，退回 Invoke-WebRequest)'
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 7200
+    }
+}
+
+# 解压 qt-everywhere-src-*.tar.xz。
+#
+# windows runner 上的 bsdtar 解 xz 是单线程且边解边落盘，700+ MB / 十几万个小文件
+# 会跑 20 分钟以上（实测 6.5.3 卡了 22 分钟）。7-Zip 解 xz 只要几十秒，
+# 所以优先 7z，失败再退回 bsdtar。
+#
+# 注意：7z x foo.tar.xz 只脱一层 xz，留下 4GB 的 .tar（实测踩过）。
+# 后面再 7z x 那个 .tar 才是源码树，所以这里必须解两次。
+function Expand-TarXz([string] $Archive, [string] $Target) {
+    $sevenZip = @(
+        'C:\Program Files\7-Zip\7z.exe',
+        'C:\Program Files (x86)\7-Zip\7z.exe'
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $sevenZip) {
+        $cmd = Get-Command 7z -ErrorAction SilentlyContinue
+        if ($cmd) { $sevenZip = $cmd.Source }
+    }
+
+    if ($sevenZip) {
+        # 第一层：xz -> tar，放在临时目录，避免污染 $Target
+        $tarDir = Join-Path $env:RUNNER_TEMP 'qt-src-untar'
+        if (Test-Path $tarDir) { Remove-Item $tarDir -Recurse -Force }
+        New-Item -ItemType Directory -Path $tarDir -Force | Out-Null
+
+        Write-Host '  使用 7-Zip 解 xz'
+        & $sevenZip x $Archive ("-o" + $tarDir) -y -bso0 -bsp0 -mmt=on
+        if ($LASTEXITCODE -eq 0) {
+            $innerTar = @(Get-ChildItem $tarDir -Filter '*.tar' -File)
+            if ($innerTar.Count -eq 1) {
+                Write-Host ("  使用 7-Zip 解 tar（{0:n0} MB）" -f ($innerTar[0].Length / 1MB))
+                & $sevenZip x $innerTar[0].FullName ("-o" + $Target) -y -bso0 -bsp0 -mmt=on
+                $ok = ($LASTEXITCODE -eq 0)
+                Remove-Item $tarDir -Recurse -Force -ErrorAction SilentlyContinue
+                if ($ok) { return }
+            }
+            else {
+                Write-Host '  7z 只解出了一层，没有内层 .tar'
+            }
+        }
+        Write-Host '  7-Zip 路线失败，退回 bsdtar'
+        Remove-Item $tarDir -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem $Target -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host '  使用 bsdtar 解压'
+    & tar -xf $Archive -C $Target
+    if ($LASTEXITCODE -ne 0) { throw "tar 解压失败 (exit $LASTEXITCODE)" }
+}
+
 function Expand-SevenZip([string] $Archive, [string] $Target) {
     $sevenZip = @(
         'C:\Program Files\7-Zip\7z.exe',
@@ -120,7 +189,7 @@ if ($Major -eq 5 -and $Series -eq '5.12') {
         if (-not (Test-Path $local)) {
             $url = '{0}/{1}' -f $PkgRoot, $name
             Write-Host "下载 $name"
-            Invoke-WebRequest -Uri $url -OutFile $local -UseBasicParsing -TimeoutSec 3600
+            Invoke-Download $url $local
         }
         Expand-SevenZip $local $Stage
         $got++
@@ -154,7 +223,7 @@ else {
         if (Test-Path $local) { Remove-Item $local -Force }
         try {
             Write-Host "下载 $url"
-            Invoke-WebRequest -Uri $url -OutFile $local -UseBasicParsing -TimeoutSec 7200
+            Invoke-Download $url $local
             if ((Get-Item $local).Length -gt 10MB) { $ok = $true; break }
             Write-Host '  文件过小，视为失败'
         }
@@ -165,8 +234,9 @@ else {
     if (-not $ok) { throw "无法下载 Qt $Version 源码（尝试过: $($candidates -join ' | ')）" }
 
     Write-Host ("解压 {0}（{1:n1} MB）" -f $fileName, ((Get-Item $local).Length / 1MB))
-    & tar -xf $local -C $Stage                # windows runner 自带 bsdtar
-    if ($LASTEXITCODE -ne 0) { throw "tar 解压失败 (exit $LASTEXITCODE)" }
+    $swTar = [Diagnostics.Stopwatch]::StartNew()
+    Expand-TarXz $local $Stage
+    Write-Host ("解压完成，用时 {0:n1} 分钟" -f $swTar.Elapsed.TotalMinutes)
 }
 
 # ---------------------------------------------------------------------------
