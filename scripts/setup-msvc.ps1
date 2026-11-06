@@ -170,13 +170,28 @@ if ($chosen.Env.ContainsKey('INCLUDE')) { $env:INCLUDE = $chosen.Env['INCLUDE'] 
 if ($chosen.Env.ContainsKey('LIB'))     { $env:LIB = $chosen.Env['LIB'] }
 
 # ---------------------------------------------------------------------------
-# 5) 校验：cl 真的能跑
+# 5) 校验：cl 真的能跑，且版本落在预期区间
+#    注意 cl 不带参数时只打横幅：
+#      Microsoft (R) C/C++ Optimizing Compiler Version 19.29.30159 for x64
+#    版本号形如 19.29.30159（三段），不是四段；用 19.xx 前缀判断工具集区间。
 # ---------------------------------------------------------------------------
 $clOut = cmd /c "call `"$($chosen.Path)\VC\Auxiliary\Build\vcvarsall.bat`" $($chosen.ArgLine) >nul 2>&1 && cl 2>&1" | Out-String
 $clVer = $null
-if ($clOut -match '(\d+\.\d+\.\d+\.\d+)') { $clVer = $Matches[1] }
+if ($clOut -match 'Compiler Version (\d+\.\d+\.\d+)') { $clVer = $Matches[1] }
 if (-not $clVer) {
     Write-Host $clOut
     throw "cl.exe 无法运行（$($chosen.Path) / $($chosen.ArgLine)）"
 }
 Write-Host "cl.exe = $clVer"
+
+# cl 19.0x -> v140 ; 19.1x -> v141 ; 19.2x -> v142 ; 19.3x+ -> v143
+# 用 minor 的十位做映射（19.29 的 minor 是 29，不是个位数），不用 if 链：
+# 各 PowerShell 版本对连续 elseif 的行为不完全一致，算术映射最稳。
+$clMinor = [int]([version]$clVer).Minor
+$tens = [math]::Floor($clMinor / 10)
+$idx  = [math]::Min([math]::Max($tens, 0), 3)
+$clLabel = [string](140 + $idx)
+if ($clLabel -ne $chosenLabel) {
+    throw "cl.exe 版本与探测结果不一致：cl=$clVer（应属 v$clLabel），探测得到 v$chosenLabel"
+}
+Write-Host ("工具集确认：cl {0} => v{1}" -f $clVer, $clLabel)
