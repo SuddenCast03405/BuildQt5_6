@@ -260,22 +260,10 @@ $realRoot = $qtbaseDir.Parent.FullName
 Write-Host ("源码根目录: {0}" -f $realRoot)
 
 # 整树包解出来的东西全都藏在 qt-everywhere-src-X.Y.Z 这一层里，而 -Dest 本身
-# 已经是空目录：直接把那一层 rename 成 -Dest 的内容最快（同盘 rename 是元数据操作）。
+# 已经是空目录：把那一层里的项逐个 rename 过去即可（同盘 rename 是元数据操作）。
 $swMove = [Diagnostics.Stopwatch]::StartNew()
-if ([IO.Path]::GetFullPath($realRoot).TrimEnd('\') -eq [IO.Path]::GetFullPath($Dest).TrimEnd('\')) {
-    Write-Host '  解压根即目标目录，无需搬移'
-}
-elseif (-not (Test-Path (Join-Path $Dest 'qtbase')) -and
-        -not (Get-ChildItem $Dest -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-    # Dest 还是空的：把 realRoot 里的项逐个 rename 到 Dest（同盘，秒级）
-    foreach ($item in Get-ChildItem $realRoot -Force) {
-        Move-Item -LiteralPath $item.FullName -Destination (Join-Path $Dest $item.Name) -Force
-    }
-}
-else {
-    foreach ($item in Get-ChildItem $realRoot -Force) {
-        Move-Item -LiteralPath $item.FullName -Destination $Dest -Force
-    }
+foreach ($item in Get-ChildItem $realRoot -Force) {
+    Move-Item -LiteralPath $item.FullName -Destination (Join-Path $Dest $item.Name) -Force
 }
 $swMove.Stop()
 Write-Host ("归位用时 {0:n1} 秒" -f $swMove.Elapsed.TotalSeconds)
