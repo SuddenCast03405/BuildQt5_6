@@ -217,34 +217,80 @@ else {
     Write-Host "ATL 缺失（$atlBase），开始补装 VC.ATL 组件"
     ('ATL_STATUS=installing') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-    $vswhereExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    $installer  = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+    # 走 VS Installer 的 setup.exe 而不是 vs_installer.exe：
+    # 后者是 UI 启动器，在无交互的 CI 会话里常常「退出码 0 但什么都没装」；
+    # setup.exe 才是真正的引导程序，支持 --quiet 完整安装。
+    $setupCandidates = @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_buildtools.exe"
+    )
+    $installer = $setupCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $installer) { throw '找不到 VS 安装器（setup.exe / vs_installer.exe / vs_buildtools.exe）' }
+    Write-Host "使用 $installer"
+    Write-Host "目标实例: $($chosen.Path)"
 
-    $addArgs = @(
+    $installArgs = @(
         'modify',
         '--installPath', "`"$($chosen.Path)`"",
         '--add', 'Microsoft.VisualStudio.Component.VC.ATL',
-        '--quiet', '--norestart', '--nocache', '--force'
+        '--quiet', '--norestart', '--nocache'
     )
-    if (Test-Path $installer) {
-        Write-Host "使用 vs_installer.exe modify"
-        $p = Start-Process -FilePath $installer -ArgumentList $addArgs -Wait -PassThru
-        Write-Host "vs_installer 退出码: $($p.ExitCode)"
-    }
-    else {
-        # 没有独立 installer 时退回 vs_buildtools（托管镜像通常也有）
-        $buildTools = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_buildtools.exe"
-        if (-not (Test-Path $buildTools)) {
-            throw "找不到 vs_installer.exe，无法补装 ATL（$installer）"
+
+    $found = $false
+    for ($attempt = 1; $attempt -le 2 -and -not $found; $attempt++) {
+        Write-Host "== ATL 安装尝试 $attempt =="
+        $p = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru
+        Write-Host "安装器退出码: $($p.ExitCode)"
+
+        # 安装器可能立刻返回 0 而把工作交给后台进程，轮询等文件真的出现
+        $deadline = (Get-Date).AddMinutes(10)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-Path $atlBase) { $found = $true; break }
+            Start-Sleep -Seconds 10
         }
-        Write-Host "使用 vs_buildtools.exe modify"
-        $p = Start-Process -FilePath $buildTools -ArgumentList $addArgs -Wait -PassThru
-        Write-Host "vs_buildtools 退出码: $($p.ExitCode)"
+        if ($found) { break }
+        Write-Host "  本轮未出现 atlbase.h，10 秒后重试"
+        Start-Sleep -Seconds 10
     }
 
-    if (-not (Test-Path $atlBase)) {
-        throw "补装 ATL 后仍找不到 $atlBase，qtspeech SAPI 插件无法编译"
+    # 还没出现就在整机范围内找一次：组件可能装到了另一套 MSVC 工具集目录下
+    if (-not $found) {
+        Write-Host '主路径仍无 atlbase.h，全盘搜索 atlmfc 目录'
+        $hits = @(Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Directory -Recurse -Depth 6 `
+                  -Filter 'atlmfc' -ErrorAction SilentlyContinue)
+        foreach ($h in $hits) {
+            $cand = Join-Path $h.FullName 'include\atlbase.h'
+            if (Test-Path $cand) {
+                Write-Host "  找到: $cand"
+                $atlBase = $cand
+                # 把包含 ATL 的那套 MSVC 的 include 加到 INCLUDE 最前面
+                $msvcRoot = Split-Path -Parent $h.FullName
+                $atlInc   = Join-Path $h.FullName 'include'
+                $atlLib   = Join-Path $h.FullName 'lib\x64'
+                Write-Host "  追加 INCLUDE: $atlInc"
+                ('INCLUDE={0};{1}' -f $atlInc, $env:INCLUDE) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                if (Test-Path $atlLib) {
+                    ('LIB={0};{1}' -f $atlLib, $env:LIB) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                }
+                $found = $true
+                break
+            }
+        }
     }
-    Write-Host "ATL 补装完成: $atlBase"
-    ('ATL_STATUS=installed') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    if ($found) {
+        Write-Host "ATL 就绪: $atlBase"
+        ('ATL_STATUS=installed') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    }
+    else {
+        # 兜底：SAPI 只是 TextToSpeech 的一个后端，丢掉它不影响 Core/Gui/Widgets 等主体。
+        # 与其让 76 分钟的构建在第 8464 个编译单元上挂掉，不如提前把这个插件从构建里摘掉。
+        # 注意：本脚本跑在 Fetch 源码之前，SRCDIR 还不存在，所以这里只记标记，
+        # 真正的补丁由工作流里 Configure 之前的步骤完成（见 Patch out qtspeech SAPI）。
+        Write-Host 'ATL 无法安装，将跳过 qtspeech 的 SAPI 语音后端'
+        Write-Host '::warning::ATL 安装失败，稍后会从构建里移除 qtspeech SAPI 插件（其余功能不受影响）'
+        ('ATL_STATUS=missing') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        ('SKIP_SPEECH_SAPI=true') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    }
 }
