@@ -166,6 +166,35 @@ jobs:
         shell: pwsh
         run: ./scripts/get-qt-source.ps1 -Version $env:QT_VERSION -Dest $env:SRCDIR -Repo ${{ inputs.qt_repo || 'official' }} -Exclude $env:SKIP_MODULES
 
+      # ATL 装不上时的兜底（见 setup-msvc.ps1 第 6 节）：
+      # qtspeech 的 SAPI 插件需要 atlbase.h，而 Qt 6.5 在 WIN32 下无条件编译它。
+      # 宁可在构建前摘掉这一个插件，也不要让 70+ 分钟的构建在最后 8% 挂掉。
+      # 条件写成字符串比较而不是 env.SKIP_SPEECH_SAPI：if 的求值早于 GITHUB_ENV 注入，
+      # 用 env 上下文容易拿到空值导致整步被静默跳过。
+      - name: Patch out qtspeech SAPI when ATL is unavailable
+        shell: pwsh
+        run: |
+          if ($env:SKIP_SPEECH_SAPI -ne 'true') {
+            Write-Host "ATL 状态: $env:ATL_STATUS —— 无需处理"
+            exit 0
+          }
+          $tts = Join-Path $env:SRCDIR 'qtspeech\src\plugins\tts\CMakeLists.txt'
+          if (-not (Test-Path $tts)) {
+            Write-Host "没有 qtspeech（可能被 -skip 跳过），无需处理"
+            exit 0
+          }
+          $body = Get-Content $tts -Raw
+          if ($body -match '(?m)^\s*add_subdirectory\(sapi\)') {
+            $patched = $body -replace '(?m)^(\s*)add_subdirectory\(sapi\)',
+              "`$1# [CI] ATL 不可用，跳过需要 atlbase.h 的 SAPI 语音后端`n`$1# add_subdirectory(sapi)"
+            Set-Content -Path $tts -Value $patched -NoNewline
+            Write-Host "已禁用 SAPI 插件: $tts"
+            Write-Host '::warning::本次构建不含 qtspeech SAPI 语音后端（Windows SAPI 需 ATL）'
+          }
+          else {
+            Write-Host 'SAPI 行已不存在（可能已打过补丁），跳过'
+          }
+
       - name: Configure Qt
         shell: pwsh
         run: |
