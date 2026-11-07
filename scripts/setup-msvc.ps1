@@ -195,3 +195,56 @@ if ($clLabel -ne $chosenLabel) {
     throw "cl.exe 版本与探测结果不一致：cl=$clVer（应属 v$clLabel），探测得到 v$chosenLabel"
 }
 Write-Host ("工具集确认：cl {0} => v{1}" -f $clVer, $clLabel)
+
+# ---------------------------------------------------------------------------
+# 6) 确保 ATL 头文件可用
+#
+# 为什么需要：qtspeech 的 SAPI 插件（qtexttospeech_sapi.cpp）间接 include
+# Windows SDK 的 sphelper.h，而它会 include atlbase.h。Qt 6.5 里这个插件在
+# WIN32 下是**无条件编译**的（没有 feature 开关），所以没装 ATL 时构建会在
+# 92% 处挂掉：fatal error C1083: Cannot open include file: 'atlbase.h'。
+# （实测 6.5.3 在 8464/9185 处失败，白烧 76 分钟。）
+#
+# windows-2022 托管镜像默认不带 ATL，需要用 VS Installer 补装
+# Microsoft.VisualStudio.Component.VC.ATL（会同时装 ATLMFC 的 x86/x64 库）。
+# ---------------------------------------------------------------------------
+$atlBase = Join-Path $chosen.Env['VCToolsInstallDir'] 'atlmfc\include\atlbase.h'
+if (Test-Path $atlBase) {
+    Write-Host "ATL 已就绪: $atlBase"
+    ('ATL_STATUS=present') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+}
+else {
+    Write-Host "ATL 缺失（$atlBase），开始补装 VC.ATL 组件"
+    ('ATL_STATUS=installing') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    $vswhereExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    $installer  = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+
+    $addArgs = @(
+        'modify',
+        '--installPath', "`"$($chosen.Path)`"",
+        '--add', 'Microsoft.VisualStudio.Component.VC.ATL',
+        '--quiet', '--norestart', '--nocache', '--force'
+    )
+    if (Test-Path $installer) {
+        Write-Host "使用 vs_installer.exe modify"
+        $p = Start-Process -FilePath $installer -ArgumentList $addArgs -Wait -PassThru
+        Write-Host "vs_installer 退出码: $($p.ExitCode)"
+    }
+    else {
+        # 没有独立 installer 时退回 vs_buildtools（托管镜像通常也有）
+        $buildTools = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_buildtools.exe"
+        if (-not (Test-Path $buildTools)) {
+            throw "找不到 vs_installer.exe，无法补装 ATL（$installer）"
+        }
+        Write-Host "使用 vs_buildtools.exe modify"
+        $p = Start-Process -FilePath $buildTools -ArgumentList $addArgs -Wait -PassThru
+        Write-Host "vs_buildtools 退出码: $($p.ExitCode)"
+    }
+
+    if (-not (Test-Path $atlBase)) {
+        throw "补装 ATL 后仍找不到 $atlBase，qtspeech SAPI 插件无法编译"
+    }
+    Write-Host "ATL 补装完成: $atlBase"
+    ('ATL_STATUS=installed') | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+}
